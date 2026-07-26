@@ -48,20 +48,22 @@ const CHALLENGE_MARKERS = [
   "cf-mitigated",
 ];
 
+// A plain link, not a button+script: the labyrinth pages carry a
+// `Content-Security-Policy: default-src 'none'` meta tag that blocks all inline
+// JS (and inline styles). Link navigation is never blocked by CSP, so href="/"
+// reliably loads another page. We also strip the CSP tag below so the inline
+// styling actually applies.
 const POPUP = `
-<div id="__another_one" style="position:fixed;bottom:16px;right:16px;z-index:2147483647;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
-  <button id="__another_one_btn" style="cursor:pointer;border:0;border-radius:999px;padding:10px 18px;font-size:14px;font-weight:600;color:#fff;background:#111;box-shadow:0 4px 14px rgba(0,0,0,.35)">
-    Another one!
-  </button>
-</div>
-<script>
-  document.getElementById('__another_one_btn').addEventListener('click', function () {
-    location.reload();
-  });
-</script>
+<a href="/" id="__another_one" style="position:fixed;bottom:16px;right:16px;z-index:2147483647;display:inline-block;text-decoration:none;cursor:pointer;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;border-radius:999px;padding:10px 18px;font-size:14px;font-weight:600;color:#fff;background:#111;box-shadow:0 4px 14px rgba(0,0,0,.35)">Another one!</a>
 `;
 
+// The labyrinth pages set `default-src 'none'` via a meta tag, which blocks our
+// injected inline styles. We re-serve the page, so strip that CSP tag.
+const CSP_META_RE =
+  /<meta[^>]*http-equiv=["']?content-security-policy["']?[^>]*>/gi;
+
 function injectPopup(html) {
+  html = html.replace(CSP_META_RE, "");
   const idx = html.toLowerCase().lastIndexOf("</body>");
   if (idx !== -1) return html.slice(0, idx) + POPUP + html.slice(idx);
   return html + POPUP;
