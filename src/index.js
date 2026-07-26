@@ -1,33 +1,31 @@
 import http from "node:http";
-import http2 from "node:http2";
+import { execFile } from "node:child_process";
 
 const TARGET = "https://foreverealize.me";
 const UA = "CCBot";
 const PORT = process.env.PORT || 8787;
 
-// Cloudflare only injects the hidden cdn-cgi/content link for HTTP/2+ clients.
-// Node's fetch()/undici speaks HTTP/1.1, so it never sees the link — hence this
-// dedicated HTTP/2 client for the upstream requests.
+// Why shell out to curl instead of node:http2?
+//
+// Cloudflare only injects the hidden cdn-cgi/content link for clients it
+// classifies as bots-to-trap, and that decision keys on the TLS + HTTP/2
+// *fingerprint* combined with the source IP. From a residential IP, Node's
+// http2 fingerprint is let through and gets the link. From a datacenter/VPS IP,
+// Cloudflare tells Node's fingerprint apart from curl's and serves Node the
+// plain (link-less) page — while curl on the exact same host still gets the
+// link. Forging curl's fingerprint from Node isn't practical, so we just use
+// the client that provably works on the host: curl (HTTP/2).
 function h2get(urlStr) {
-  const url = new URL(urlStr);
   return new Promise((resolve, reject) => {
-    const client = http2.connect(url.origin);
-    client.on("error", reject);
-    const req = client.request({
-      ":method": "GET",
-      ":path": url.pathname + url.search,
-      "user-agent": UA,
-    });
-    const chunks = [];
-    let status;
-    req.on("response", (h) => (status = h[":status"]));
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
-      client.close();
-      resolve({ status, body: Buffer.concat(chunks).toString("utf8") });
-    });
-    req.on("error", reject);
-    req.end();
+    execFile(
+      "curl",
+      ["-s", "--http2", "-A", UA, "--max-time", "30", urlStr],
+      { maxBuffer: 64 * 1024 * 1024, encoding: "utf8" },
+      (err, stdout) => {
+        if (err) return reject(new Error("curl failed: " + err.message));
+        resolve({ status: 200, body: stdout });
+      }
+    );
   });
 }
 
@@ -36,6 +34,19 @@ function h2get(urlStr) {
 // The href is what we care about; the id changes on every request.
 const CONTENT_LINK_RE =
   /<a\b[^>]*\bhref=["'](https?:\/\/[^"']*\/cdn-cgi\/content\?id=[^"']+)["'][^>]*>/i;
+
+// Fingerprints of a Cloudflare challenge / block page — used to explain a
+// missing content link (typically means this egress IP is being challenged).
+const CHALLENGE_MARKERS = [
+  "Just a moment",
+  "challenge-platform",
+  "cf_chl_opt",
+  "_cf_chl",
+  "Enable JavaScript and cookies to continue",
+  "Attention Required",
+  "Sorry, you have been blocked",
+  "cf-mitigated",
+];
 
 const POPUP = `
 <div id="__another_one" style="position:fixed;bottom:16px;right:16px;z-index:2147483647;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
@@ -63,9 +74,23 @@ async function handle(res) {
   // 2. Find the hidden cdn-cgi/content link.
   const match = root.body.match(CONTENT_LINK_RE);
   if (!match) {
-    // No link found — hand back the raw page as plaintext so it isn't rendered.
+    // No link found. Cloudflare served the plain (link-less) page. Report what we
+    // got so the cause is visible instead of a blank-looking dump.
+    const markers = CHALLENGE_MARKERS.filter((m) => root.body.includes(m));
+    const title = (root.body.match(/<title>([^<]*)<\/title>/i) || [])[1] || "(none)";
+    const report =
+      `No cdn-cgi/content link found in the response from ${TARGET}.\n` +
+      `status:            ${root.status}\n` +
+      `body length:       ${root.body.length}\n` +
+      `<title>:           ${title}\n` +
+      `challenge markers: ${markers.length ? markers.join(", ") : "none"}\n` +
+      (markers.length
+        ? `\n=> Cloudflare returned a challenge page for this request.\n`
+        : `\n=> Plain page, no labyrinth injected. Confirm curl gets the link on this\n` +
+          `   host: curl -s --http2 -A CCBot ${TARGET} | grep -c 'cdn-cgi/content?id='\n`) +
+      `\n----- raw body -----\n`;
     res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-    res.end(root.body);
+    res.end(report + root.body);
     return;
   }
 
